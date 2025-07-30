@@ -1,450 +1,288 @@
-"use strict";
+/*!
+ * to-regex-range <https://github.com/micromatch/to-regex-range>
+ *
+ * Copyright (c) 2015-present, Jon Schlinkert.
+ * Released under the MIT License.
+ */
 
-function makeException(ErrorType, message, options) {
-  if (options.globals) {
-    ErrorType = options.globals[ErrorType.name];
-  }
-  return new ErrorType(`${options.context ? options.context : "Value"} ${message}.`);
-}
+'use strict';
 
-function toNumber(value, options) {
-  if (typeof value === "bigint") {
-    throw makeException(TypeError, "is a BigInt which cannot be converted to a number", options);
-  }
-  if (!options.globals) {
-    return Number(value);
-  }
-  return options.globals.Number(value);
-}
+const isNumber = require('is-number');
 
-// Round x to the nearest integer, choosing the even integer if it lies halfway between two.
-function evenRound(x) {
-  // There are four cases for numbers with fractional part being .5:
-  //
-  // case |     x     | floor(x) | round(x) | expected | x <> 0 | x % 1 | x & 1 |   example
-  //   1  |  2n + 0.5 |  2n      |  2n + 1  |  2n      |   >    |  0.5  |   0   |  0.5 ->  0
-  //   2  |  2n + 1.5 |  2n + 1  |  2n + 2  |  2n + 2  |   >    |  0.5  |   1   |  1.5 ->  2
-  //   3  | -2n - 0.5 | -2n - 1  | -2n      | -2n      |   <    | -0.5  |   0   | -0.5 ->  0
-  //   4  | -2n - 1.5 | -2n - 2  | -2n - 1  | -2n - 2  |   <    | -0.5  |   1   | -1.5 -> -2
-  // (where n is a non-negative integer)
-  //
-  // Branch here for cases 1 and 4
-  if ((x > 0 && (x % 1) === +0.5 && (x & 1) === 0) ||
-        (x < 0 && (x % 1) === -0.5 && (x & 1) === 1)) {
-    return censorNegativeZero(Math.floor(x));
+const toRegexRange = (min, max, options) => {
+  if (isNumber(min) === false) {
+    throw new TypeError('toRegexRange: expected the first argument to be a number');
   }
 
-  return censorNegativeZero(Math.round(x));
-}
-
-function integerPart(n) {
-  return censorNegativeZero(Math.trunc(n));
-}
-
-function sign(x) {
-  return x < 0 ? -1 : 1;
-}
-
-function modulo(x, y) {
-  // https://tc39.github.io/ecma262/#eqn-modulo
-  // Note that http://stackoverflow.com/a/4467559/3191 does NOT work for large modulos
-  const signMightNotMatch = x % y;
-  if (sign(y) !== sign(signMightNotMatch)) {
-    return signMightNotMatch + y;
-  }
-  return signMightNotMatch;
-}
-
-function censorNegativeZero(x) {
-  return x === 0 ? 0 : x;
-}
-
-function createIntegerConversion(bitLength, { unsigned }) {
-  let lowerBound, upperBound;
-  if (unsigned) {
-    lowerBound = 0;
-    upperBound = 2 ** bitLength - 1;
-  } else {
-    lowerBound = -(2 ** (bitLength - 1));
-    upperBound = 2 ** (bitLength - 1) - 1;
+  if (max === void 0 || min === max) {
+    return String(min);
   }
 
-  const twoToTheBitLength = 2 ** bitLength;
-  const twoToOneLessThanTheBitLength = 2 ** (bitLength - 1);
+  if (isNumber(max) === false) {
+    throw new TypeError('toRegexRange: expected the second argument to be a number.');
+  }
 
-  return (value, options = {}) => {
-    let x = toNumber(value, options);
-    x = censorNegativeZero(x);
+  let opts = { relaxZeros: true, ...options };
+  if (typeof opts.strictZeros === 'boolean') {
+    opts.relaxZeros = opts.strictZeros === false;
+  }
 
-    if (options.enforceRange) {
-      if (!Number.isFinite(x)) {
-        throw makeException(TypeError, "is not a finite number", options);
-      }
+  let relax = String(opts.relaxZeros);
+  let shorthand = String(opts.shorthand);
+  let capture = String(opts.capture);
+  let wrap = String(opts.wrap);
+  let cacheKey = min + ':' + max + '=' + relax + shorthand + capture + wrap;
 
-      x = integerPart(x);
+  if (toRegexRange.cache.hasOwnProperty(cacheKey)) {
+    return toRegexRange.cache[cacheKey].result;
+  }
 
-      if (x < lowerBound || x > upperBound) {
-        throw makeException(
-          TypeError,
-          `is outside the accepted range of ${lowerBound} to ${upperBound}, inclusive`,
-          options
-        );
-      }
+  let a = Math.min(min, max);
+  let b = Math.max(min, max);
 
-      return x;
+  if (Math.abs(a - b) === 1) {
+    let result = min + '|' + max;
+    if (opts.capture) {
+      return `(${result})`;
     }
-
-    if (!Number.isNaN(x) && options.clamp) {
-      x = Math.min(Math.max(x, lowerBound), upperBound);
-      x = evenRound(x);
-      return x;
+    if (opts.wrap === false) {
+      return result;
     }
+    return `(?:${result})`;
+  }
 
-    if (!Number.isFinite(x) || x === 0) {
-      return 0;
-    }
-    x = integerPart(x);
+  let isPadded = hasPadding(min) || hasPadding(max);
+  let state = { min, max, a, b };
+  let positives = [];
+  let negatives = [];
 
-    // Math.pow(2, 64) is not accurately representable in JavaScript, so try to avoid these per-spec operations if
-    // possible. Hopefully it's an optimization for the non-64-bitLength cases too.
-    if (x >= lowerBound && x <= upperBound) {
-      return x;
-    }
+  if (isPadded) {
+    state.isPadded = isPadded;
+    state.maxLen = String(state.max).length;
+  }
 
-    // These will not work great for bitLength of 64, but oh well. See the README for more details.
-    x = modulo(x, twoToTheBitLength);
-    if (!unsigned && x >= twoToOneLessThanTheBitLength) {
-      return x - twoToTheBitLength;
-    }
-    return x;
-  };
-}
+  if (a < 0) {
+    let newMin = b < 0 ? Math.abs(b) : 1;
+    negatives = splitToPatterns(newMin, Math.abs(a), state, opts);
+    a = state.a = 0;
+  }
 
-function createLongLongConversion(bitLength, { unsigned }) {
-  const upperBound = Number.MAX_SAFE_INTEGER;
-  const lowerBound = unsigned ? 0 : Number.MIN_SAFE_INTEGER;
-  const asBigIntN = unsigned ? BigInt.asUintN : BigInt.asIntN;
+  if (b >= 0) {
+    positives = splitToPatterns(a, b, state, opts);
+  }
 
-  return (value, options = {}) => {
-    let x = toNumber(value, options);
-    x = censorNegativeZero(x);
+  state.negatives = negatives;
+  state.positives = positives;
+  state.result = collatePatterns(negatives, positives, opts);
 
-    if (options.enforceRange) {
-      if (!Number.isFinite(x)) {
-        throw makeException(TypeError, "is not a finite number", options);
-      }
+  if (opts.capture === true) {
+    state.result = `(${state.result})`;
+  } else if (opts.wrap !== false && (positives.length + negatives.length) > 1) {
+    state.result = `(?:${state.result})`;
+  }
 
-      x = integerPart(x);
-
-      if (x < lowerBound || x > upperBound) {
-        throw makeException(
-          TypeError,
-          `is outside the accepted range of ${lowerBound} to ${upperBound}, inclusive`,
-          options
-        );
-      }
-
-      return x;
-    }
-
-    if (!Number.isNaN(x) && options.clamp) {
-      x = Math.min(Math.max(x, lowerBound), upperBound);
-      x = evenRound(x);
-      return x;
-    }
-
-    if (!Number.isFinite(x) || x === 0) {
-      return 0;
-    }
-
-    let xBigInt = BigInt(integerPart(x));
-    xBigInt = asBigIntN(bitLength, xBigInt);
-    return Number(xBigInt);
-  };
-}
-
-exports.any = value => {
-  return value;
+  toRegexRange.cache[cacheKey] = state;
+  return state.result;
 };
 
-exports.undefined = () => {
-  return undefined;
-};
+function collatePatterns(neg, pos, options) {
+  let onlyNegative = filterPatterns(neg, pos, '-', false, options) || [];
+  let onlyPositive = filterPatterns(pos, neg, '', false, options) || [];
+  let intersected = filterPatterns(neg, pos, '-?', true, options) || [];
+  let subpatterns = onlyNegative.concat(intersected).concat(onlyPositive);
+  return subpatterns.join('|');
+}
 
-exports.boolean = value => {
-  return Boolean(value);
-};
+function splitToRanges(min, max) {
+  let nines = 1;
+  let zeros = 1;
 
-exports.byte = createIntegerConversion(8, { unsigned: false });
-exports.octet = createIntegerConversion(8, { unsigned: true });
+  let stop = countNines(min, nines);
+  let stops = new Set([max]);
 
-exports.short = createIntegerConversion(16, { unsigned: false });
-exports["unsigned short"] = createIntegerConversion(16, { unsigned: true });
-
-exports.long = createIntegerConversion(32, { unsigned: false });
-exports["unsigned long"] = createIntegerConversion(32, { unsigned: true });
-
-exports["long long"] = createLongLongConversion(64, { unsigned: false });
-exports["unsigned long long"] = createLongLongConversion(64, { unsigned: true });
-
-exports.double = (value, options = {}) => {
-  const x = toNumber(value, options);
-
-  if (!Number.isFinite(x)) {
-    throw makeException(TypeError, "is not a finite floating-point value", options);
+  while (min <= stop && stop <= max) {
+    stops.add(stop);
+    nines += 1;
+    stop = countNines(min, nines);
   }
 
-  return x;
-};
+  stop = countZeros(max + 1, zeros) - 1;
 
-exports["unrestricted double"] = (value, options = {}) => {
-  const x = toNumber(value, options);
-
-  return x;
-};
-
-exports.float = (value, options = {}) => {
-  const x = toNumber(value, options);
-
-  if (!Number.isFinite(x)) {
-    throw makeException(TypeError, "is not a finite floating-point value", options);
+  while (min < stop && stop <= max) {
+    stops.add(stop);
+    zeros += 1;
+    stop = countZeros(max + 1, zeros) - 1;
   }
 
-  if (Object.is(x, -0)) {
-    return x;
+  stops = [...stops];
+  stops.sort(compare);
+  return stops;
+}
+
+/**
+ * Convert a range to a regex pattern
+ * @param {Number} `start`
+ * @param {Number} `stop`
+ * @return {String}
+ */
+
+function rangeToPattern(start, stop, options) {
+  if (start === stop) {
+    return { pattern: start, count: [], digits: 0 };
   }
 
-  const y = Math.fround(x);
+  let zipped = zip(start, stop);
+  let digits = zipped.length;
+  let pattern = '';
+  let count = 0;
 
-  if (!Number.isFinite(y)) {
-    throw makeException(TypeError, "is outside the range of a single-precision floating-point value", options);
-  }
+  for (let i = 0; i < digits; i++) {
+    let [startDigit, stopDigit] = zipped[i];
 
-  return y;
-};
+    if (startDigit === stopDigit) {
+      pattern += startDigit;
 
-exports["unrestricted float"] = (value, options = {}) => {
-  const x = toNumber(value, options);
+    } else if (startDigit !== '0' || stopDigit !== '9') {
+      pattern += toCharacterClass(startDigit, stopDigit, options);
 
-  if (isNaN(x)) {
-    return x;
-  }
-
-  if (Object.is(x, -0)) {
-    return x;
-  }
-
-  return Math.fround(x);
-};
-
-exports.DOMString = (value, options = {}) => {
-  if (options.treatNullAsEmptyString && value === null) {
-    return "";
-  }
-
-  if (typeof value === "symbol") {
-    throw makeException(TypeError, "is a symbol, which cannot be converted to a string", options);
-  }
-
-  const StringCtor = options.globals ? options.globals.String : String;
-  return StringCtor(value);
-};
-
-exports.ByteString = (value, options = {}) => {
-  const x = exports.DOMString(value, options);
-  let c;
-  for (let i = 0; (c = x.codePointAt(i)) !== undefined; ++i) {
-    if (c > 255) {
-      throw makeException(TypeError, "is not a valid ByteString", options);
-    }
-  }
-
-  return x;
-};
-
-exports.USVString = (value, options = {}) => {
-  const S = exports.DOMString(value, options);
-  const n = S.length;
-  const U = [];
-  for (let i = 0; i < n; ++i) {
-    const c = S.charCodeAt(i);
-    if (c < 0xD800 || c > 0xDFFF) {
-      U.push(String.fromCodePoint(c));
-    } else if (0xDC00 <= c && c <= 0xDFFF) {
-      U.push(String.fromCodePoint(0xFFFD));
-    } else if (i === n - 1) {
-      U.push(String.fromCodePoint(0xFFFD));
     } else {
-      const d = S.charCodeAt(i + 1);
-      if (0xDC00 <= d && d <= 0xDFFF) {
-        const a = c & 0x3FF;
-        const b = d & 0x3FF;
-        U.push(String.fromCodePoint((2 << 15) + ((2 << 9) * a) + b));
-        ++i;
-      } else {
-        U.push(String.fromCodePoint(0xFFFD));
+      count++;
+    }
+  }
+
+  if (count) {
+    pattern += options.shorthand === true ? '\\d' : '[0-9]';
+  }
+
+  return { pattern, count: [count], digits };
+}
+
+function splitToPatterns(min, max, tok, options) {
+  let ranges = splitToRanges(min, max);
+  let tokens = [];
+  let start = min;
+  let prev;
+
+  for (let i = 0; i < ranges.length; i++) {
+    let max = ranges[i];
+    let obj = rangeToPattern(String(start), String(max), options);
+    let zeros = '';
+
+    if (!tok.isPadded && prev && prev.pattern === obj.pattern) {
+      if (prev.count.length > 1) {
+        prev.count.pop();
       }
+
+      prev.count.push(obj.count[0]);
+      prev.string = prev.pattern + toQuantifier(prev.count);
+      start = max + 1;
+      continue;
     }
+
+    if (tok.isPadded) {
+      zeros = padZeros(max, tok, options);
+    }
+
+    obj.string = zeros + obj.pattern + toQuantifier(obj.count);
+    tokens.push(obj);
+    start = max + 1;
+    prev = obj;
   }
 
-  return U.join("");
-};
-
-exports.object = (value, options = {}) => {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    throw makeException(TypeError, "is not an object", options);
-  }
-
-  return value;
-};
-
-const abByteLengthGetter =
-    Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
-const sabByteLengthGetter =
-    typeof SharedArrayBuffer === "function" ?
-      Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength").get :
-      null;
-
-function isNonSharedArrayBuffer(value) {
-  try {
-    // This will throw on SharedArrayBuffers, but not detached ArrayBuffers.
-    // (The spec says it should throw, but the spec conflicts with implementations: https://github.com/tc39/ecma262/issues/678)
-    abByteLengthGetter.call(value);
-
-    return true;
-  } catch {
-    return false;
-  }
+  return tokens;
 }
 
-function isSharedArrayBuffer(value) {
-  try {
-    sabByteLengthGetter.call(value);
-    return true;
-  } catch {
-    return false;
+function filterPatterns(arr, comparison, prefix, intersection, options) {
+  let result = [];
+
+  for (let ele of arr) {
+    let { string } = ele;
+
+    // only push if _both_ are negative...
+    if (!intersection && !contains(comparison, 'string', string)) {
+      result.push(prefix + string);
+    }
+
+    // or _both_ are positive
+    if (intersection && contains(comparison, 'string', string)) {
+      result.push(prefix + string);
+    }
   }
+  return result;
 }
 
-function isArrayBufferDetached(value) {
-  try {
-    // eslint-disable-next-line no-new
-    new Uint8Array(value);
-    return false;
-  } catch {
-    return true;
-  }
+/**
+ * Zip strings
+ */
+
+function zip(a, b) {
+  let arr = [];
+  for (let i = 0; i < a.length; i++) arr.push([a[i], b[i]]);
+  return arr;
 }
 
-exports.ArrayBuffer = (value, options = {}) => {
-  if (!isNonSharedArrayBuffer(value)) {
-    if (options.allowShared && !isSharedArrayBuffer(value)) {
-      throw makeException(TypeError, "is not an ArrayBuffer or SharedArrayBuffer", options);
-    }
-    throw makeException(TypeError, "is not an ArrayBuffer", options);
+function compare(a, b) {
+  return a > b ? 1 : b > a ? -1 : 0;
+}
+
+function contains(arr, key, val) {
+  return arr.some(ele => ele[key] === val);
+}
+
+function countNines(min, len) {
+  return Number(String(min).slice(0, -len) + '9'.repeat(len));
+}
+
+function countZeros(integer, zeros) {
+  return integer - (integer % Math.pow(10, zeros));
+}
+
+function toQuantifier(digits) {
+  let [start = 0, stop = ''] = digits;
+  if (stop || start > 1) {
+    return `{${start + (stop ? ',' + stop : '')}}`;
   }
-  if (isArrayBufferDetached(value)) {
-    throw makeException(TypeError, "is a detached ArrayBuffer", options);
-  }
+  return '';
+}
 
-  return value;
-};
+function toCharacterClass(a, b, options) {
+  return `[${a}${(b - a === 1) ? '' : '-'}${b}]`;
+}
 
-const dvByteLengthGetter =
-    Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength").get;
-exports.DataView = (value, options = {}) => {
-  try {
-    dvByteLengthGetter.call(value);
-  } catch (e) {
-    throw makeException(TypeError, "is not a DataView", options);
-  }
+function hasPadding(str) {
+  return /^-?(0+)\d/.test(str);
+}
 
-  if (!options.allowShared && isSharedArrayBuffer(value.buffer)) {
-    throw makeException(TypeError, "is backed by a SharedArrayBuffer, which is not allowed", options);
-  }
-  if (isArrayBufferDetached(value.buffer)) {
-    throw makeException(TypeError, "is backed by a detached ArrayBuffer", options);
-  }
-
-  return value;
-};
-
-// Returns the unforgeable `TypedArray` constructor name or `undefined`,
-// if the `this` value isn't a valid `TypedArray` object.
-//
-// https://tc39.es/ecma262/#sec-get-%typedarray%.prototype-@@tostringtag
-const typedArrayNameGetter = Object.getOwnPropertyDescriptor(
-  Object.getPrototypeOf(Uint8Array).prototype,
-  Symbol.toStringTag
-).get;
-[
-  Int8Array,
-  Int16Array,
-  Int32Array,
-  Uint8Array,
-  Uint16Array,
-  Uint32Array,
-  Uint8ClampedArray,
-  Float32Array,
-  Float64Array
-].forEach(func => {
-  const { name } = func;
-  const article = /^[AEIOU]/u.test(name) ? "an" : "a";
-  exports[name] = (value, options = {}) => {
-    if (!ArrayBuffer.isView(value) || typedArrayNameGetter.call(value) !== name) {
-      throw makeException(TypeError, `is not ${article} ${name} object`, options);
-    }
-    if (!options.allowShared && isSharedArrayBuffer(value.buffer)) {
-      throw makeException(TypeError, "is a view on a SharedArrayBuffer, which is not allowed", options);
-    }
-    if (isArrayBufferDetached(value.buffer)) {
-      throw makeException(TypeError, "is a view on a detached ArrayBuffer", options);
-    }
-
-    return value;
-  };
-});
-
-// Common definitions
-
-exports.ArrayBufferView = (value, options = {}) => {
-  if (!ArrayBuffer.isView(value)) {
-    throw makeException(TypeError, "is not a view on an ArrayBuffer or SharedArrayBuffer", options);
-  }
-
-  if (!options.allowShared && isSharedArrayBuffer(value.buffer)) {
-    throw makeException(TypeError, "is a view on a SharedArrayBuffer, which is not allowed", options);
-  }
-
-  if (isArrayBufferDetached(value.buffer)) {
-    throw makeException(TypeError, "is a view on a detached ArrayBuffer", options);
-  }
-  return value;
-};
-
-exports.BufferSource = (value, options = {}) => {
-  if (ArrayBuffer.isView(value)) {
-    if (!options.allowShared && isSharedArrayBuffer(value.buffer)) {
-      throw makeException(TypeError, "is a view on a SharedArrayBuffer, which is not allowed", options);
-    }
-
-    if (isArrayBufferDetached(value.buffer)) {
-      throw makeException(TypeError, "is a view on a detached ArrayBuffer", options);
-    }
+function padZeros(value, tok, options) {
+  if (!tok.isPadded) {
     return value;
   }
 
-  if (!options.allowShared && !isNonSharedArrayBuffer(value)) {
-    throw makeException(TypeError, "is not an ArrayBuffer or a view on one", options);
-  }
-  if (options.allowShared && !isSharedArrayBuffer(value) && !isNonSharedArrayBuffer(value)) {
-    throw makeException(TypeError, "is not an ArrayBuffer, SharedArrayBuffer, or a view on one", options);
-  }
-  if (isArrayBufferDetached(value)) {
-    throw makeException(TypeError, "is a detached ArrayBuffer", options);
-  }
+  let diff = Math.abs(tok.maxLen - String(value).length);
+  let relax = options.relaxZeros !== false;
 
-  return value;
-};
+  switch (diff) {
+    case 0:
+      return '';
+    case 1:
+      return relax ? '0?' : '0';
+    case 2:
+      return relax ? '0{0,2}' : '00';
+    default: {
+      return relax ? `0{0,${diff}}` : `0{${diff}}`;
+    }
+  }
+}
 
-exports.DOMTimeStamp = exports["unsigned long long"];
+/**
+ * Cache
+ */
+
+toRegexRange.cache = {};
+toRegexRange.clearCache = () => (toRegexRange.cache = {});
+
+/**
+ * Expose `toRegexRange`
+ */
+
+module.exports = toRegexRange;
